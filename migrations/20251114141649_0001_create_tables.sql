@@ -54,9 +54,20 @@ CREATE INDEX idx_pr_reviewers_pr_id ON pr_reviewers(pr_id);
 
 -- +goose Down
 -- +goose StatementBegin
+DROP INDEX IF EXISTS idx_users_is_active;
+DROP INDEX IF EXISTS idx_users_external_id;
+DROP INDEX IF EXISTS idx_team_users_user_id;
+DROP INDEX IF EXISTS idx_team_users_team_id;
+DROP INDEX IF EXISTS idx_pull_requests_external_id;
+DROP INDEX IF EXISTS idx_pull_requests_author_id;
+DROP INDEX IF EXISTS idx_pull_requests_status;
+DROP INDEX IF EXISTS idx_pr_reviewers_reviewer_id;
+DROP INDEX IF EXISTS idx_pr_reviewers_pr_id;
+
 DROP TABLE IF EXISTS pr_reviewers;
 DROP TABLE IF EXISTS pull_requests;
 DROP TABLE IF EXISTS team_users;
 DROP TABLE IF EXISTS teams;
 DROP TABLE IF EXISTS users;
 -- +goose StatementEnd
+
