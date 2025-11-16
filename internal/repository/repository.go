@@ -386,57 +386,145 @@ func (r *Repository) MergePR(ctx context.Context, pullRequestID string) (*models
 }
 
 // ReassignReviewer переназначает ревьюера
-func (r *Repository) ReassignReviewer(ctx context.Context, pullRequestID, oldReviewerID, newReviewerID string) error {
-	oID, err := strconv.ParseInt(oldReviewerID, 10, 64)
-	if err != nil {
-		return ErrInvalidInput
+func (r *Repository) ReassignReviewerAuto(ctx context.Context, pullRequestID, oldReviewerID string) (string, error) {
+	// Получаем внутренний ID старого ревьюера
+	var rInternalID int64
+	usersQuery := `SELECT id FROM users WHERE external_id = $1`
+	err := r.pool.QueryRow(ctx, usersQuery, oldReviewerID).Scan(&rInternalID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
 	}
-	nID, err := strconv.ParseInt(newReviewerID, 10, 64)
 	if err != nil {
-		return ErrInvalidInput
+		return "", fmt.Errorf("failed to get old reviewer: %w", err)
 	}
-
+	
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
+		return "", fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
-
-	// Находим внутренний ID и проверяем статус
-	var internalID int64
+	
+	// Находим внутренний ID PR и проверяем статус
+	var prInternalID int64
 	var status string
-	checkQuery := `SELECT id, status FROM pull_requests WHERE external_id = $1`
-
-	err = tx.QueryRow(ctx, checkQuery, pullRequestID).Scan(&internalID, &status)
+	var authorID int64
+	checkQuery := `SELECT id, status, author_id FROM pull_requests WHERE external_id = $1`
+	err = tx.QueryRow(ctx, checkQuery, pullRequestID).Scan(&prInternalID, &status, &authorID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return ErrNotFound
+		return "", ErrNotFound
 	}
 	if err != nil {
-		return fmt.Errorf("failed to check PR status: %w", err)
+		return "", fmt.Errorf("failed to check PR status: %w", err)
 	}
 	if status == models.StatusMerged {
-		return ErrAlreadyMerged
+		return "", ErrAlreadyMerged
 	}
-
-	// Удаляем старого ревьюера по внутреннему ID
-	tag, err := tx.Exec(ctx, `DELETE FROM pr_reviewers WHERE pr_id = $1 AND reviewer_id = $2`,
-		internalID, oID)
+	
+	// Проверяем, что старый ревьюер действительно назначен
+	var exists bool
+	checkReviewerQuery := `SELECT EXISTS(SELECT 1 FROM pr_reviewers WHERE pr_id = $1 AND reviewer_id = $2)`
+	err = tx.QueryRow(ctx, checkReviewerQuery, prInternalID, rInternalID).Scan(&exists)
 	if err != nil {
-		return fmt.Errorf("failed to remove old reviewer: %w", err)
+		return "", fmt.Errorf("failed to check reviewer assignment: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
+	
+	if !exists {
+		return "", ErrNotFound // Ревьюер не назначен
 	}
-
-	// Добавляем нового ревьюера по внутреннему ID
-	_, err = tx.Exec(ctx, `INSERT INTO pr_reviewers (pr_id, reviewer_id) VALUES ($1, $2)
-                           ON CONFLICT DO NOTHING`,
-		internalID, nID)
+	
+	// Получаем команду автора PR
+	var teamID int64
+	teamQuery := `SELECT team_id FROM team_users WHERE user_id = $1 LIMIT 1`
+	err = tx.QueryRow(ctx, teamQuery, authorID).Scan(&teamID)
 	if err != nil {
-		return fmt.Errorf("failed to add new reviewer: %w", err)
+		return "", fmt.Errorf("failed to get author's team: %w", err)
 	}
+	
+	// Получаем текущих ревьюеров PR
+	currentReviewersQuery := `SELECT reviewer_id FROM pr_reviewers WHERE pr_id = $1`
+	rows, err := tx.Query(ctx, currentReviewersQuery, prInternalID)
+	if err != nil {
+		return "", fmt.Errorf("failed to get current reviewers: %w", err)
+	}
+	
+	var currentReviewers []int64
+	for rows.Next() {
+		var rID int64
+		if err := rows.Scan(&rID); err != nil {
+			rows.Close()
+			return "", fmt.Errorf("failed to scan reviewer: %w", err)
+		}
+		currentReviewers = append(currentReviewers, rID)
+	}
+	rows.Close()
+	
+	// Ищем нового кандидата: активный член команды, не автор, не текущий ревьюер
+	candidateQuery := `
+		SELECT tu.user_id
+		FROM team_users tu
+		JOIN users u ON tu.user_id = u.id
+		WHERE tu.team_id = $1
+		AND u.is_active = true
+		AND tu.user_id != $2
+		AND tu.user_id != ALL($3)
+		ORDER BY RANDOM()
+		LIMIT 1
+	`
+	
+	var newReviewerID int64
+	err = tx.QueryRow(ctx, candidateQuery, teamID, authorID, currentReviewers).Scan(&newReviewerID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound // Нет подходящих кандидатов
+	}
+	
+	if err != nil {
+		return "", fmt.Errorf("failed to find replacement candidate: %w", err)
+	}
+	
+	// Удаляем старого ревьюера
+	_, err = tx.Exec(ctx, `DELETE FROM pr_reviewers WHERE pr_id = $1 AND reviewer_id = $2`, prInternalID, rInternalID)
+	if err != nil {
+		return "", fmt.Errorf("failed to remove old reviewer: %w", err)
+	}
+	
+	// Добавляем нового ревьюера
+	_, err = tx.Exec(ctx, `INSERT INTO pr_reviewers (pr_id, reviewer_id) VALUES ($1, $2)`, prInternalID, newReviewerID)
+	if err != nil {
+		return "", fmt.Errorf("failed to add new reviewer: %w", err)
+	}
+	
+	if err = tx.Commit(ctx); err != nil {
+		return "", fmt.Errorf("failed to commit transaction: %w", err)
+	}
+	
+	return strconv.FormatInt(newReviewerID, 10), nil
+}
 
-	return tx.Commit(ctx)
+// GetUser получает пользователя по внешнему ID
+func (r *Repository) GetUser(ctx context.Context, userID string) (*models.User, error) {
+	query := `
+		SELECT u.external_id, u.name, t.name as team_name, u.is_active
+		FROM users u
+		LEFT JOIN team_users tu ON u.id = tu.user_id
+		LEFT JOIN teams t ON tu.team_id = t.id
+		WHERE u.external_id = $1
+		LIMIT 1
+	`
+	
+	var user models.User
+	err := r.pool.QueryRow(ctx, query, userID).Scan(
+		&user.UserID, &user.Username, &user.TeamName, &user.IsActive,
+	)
+	
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	
+	if err != nil {
+		return nil, fmt.Errorf("failed to get user: %w", err)
+	}
+	
+	return &user, nil
 }
 
 // GetUserTeams получает все команды пользователя

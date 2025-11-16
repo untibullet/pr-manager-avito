@@ -12,4 +12,4 @@ server:
 
 logger:
   level: info
-  format: json
+  format: console
