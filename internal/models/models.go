@@ -3,31 +3,47 @@ package models
 
 import "time"
 
-type User struct {
-    ID        int64     `json:"id" db:"id"`
-    Name      string    `json:"name" db:"name"`
-    IsActive  bool      `json:"isActive" db:"is_active"`
-    CreatedAt time.Time `json:"createdAt" db:"created_at"`
-    UpdatedAt time.Time `json:"updatedAt" db:"updated_at"`
+// TeamMember представляет участника команды
+type TeamMember struct {
+    UserID   string `json:"user_id" db:"user_id"`
+    Username string `json:"username" db:"username"`
+    IsActive bool   `json:"is_active" db:"is_active"`
 }
 
+// Team представляет команду с участниками
 type Team struct {
-    ID        int64     `json:"id" db:"id"`
-    Name      string    `json:"name" db:"name"`
-    CreatedAt time.Time `json:"createdAt" db:"created_at"`
-    UpdatedAt time.Time `json:"updatedAt" db:"updated_at"`
+    TeamName string       `json:"team_name" db:"team_name"`
+    Members  []TeamMember `json:"members" db:"-"`
 }
 
+// User представляет пользователя с принадлежностью к команде
+type User struct {
+    UserID   string `json:"user_id" db:"user_id"`
+    Username string `json:"username" db:"username"`
+    TeamName string `json:"team_name" db:"team_name"`
+    IsActive bool   `json:"is_active" db:"is_active"`
+}
+
+// PullRequest представляет PR с полной информацией
 type PullRequest struct {
-    ID        int64     `json:"id" db:"id"`
-    Title     string    `json:"title" db:"title"`
-    AuthorID  int64     `json:"authorId" db:"author_id"`
-    Status    string    `json:"status" db:"status"`
-    CreatedAt time.Time `json:"createdAt" db:"created_at"`
-    UpdatedAt time.Time `json:"updatedAt" db:"updated_at"`
-    Reviewers []int64   `json:"reviewers,omitempty" db:"-"`
+    PullRequestID      string    `json:"pull_request_id" db:"pull_request_id"`
+    PullRequestName    string    `json:"pull_request_name" db:"pull_request_name"`
+    AuthorID           string    `json:"author_id" db:"author_id"`
+    Status             string    `json:"status" db:"status"`
+    AssignedReviewers  []string  `json:"assigned_reviewers" db:"-"`
+    CreatedAt          *time.Time `json:"createdAt,omitempty" db:"created_at"`
+    MergedAt           *time.Time `json:"mergedAt,omitempty" db:"merged_at"`
 }
 
+// PullRequestShort представляет краткую информацию о PR
+type PullRequestShort struct {
+    PullRequestID   string `json:"pull_request_id" db:"pull_request_id"`
+    PullRequestName string `json:"pull_request_name" db:"pull_request_name"`
+    AuthorID        string `json:"author_id" db:"author_id"`
+    Status          string `json:"status" db:"status"`
+}
+
+// Константы статусов PR
 const (
     StatusOpen   = "OPEN"
     StatusMerged = "MERGED"
