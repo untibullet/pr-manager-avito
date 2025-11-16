@@ -1,0 +1,122 @@
+### BASE URL (настрой по своему окружению)
+@baseUrl = http://localhost:8081
+
+### 1. Healthcheck
+
+GET {{baseUrl}}/health
+Accept: application/json
+
+###
+
+### 2. Создать команду backend с 3 активными участниками
+
+POST {{baseUrl}}/team/add
+Content-Type: application/json
+Accept: application/json
+
+{
+  "team_name": "backend",
+  "members": [
+    {
+      "user_id": "u1",
+      "username": "Alice",
+      "is_active": true
+    },
+    {
+      "user_id": "u2",
+      "username": "Bob",
+      "is_active": true
+    },
+    {
+      "user_id": "u3",
+      "username": "Charlie",
+      "is_active": true
+    },
+    {
+      "user_id": "u4",
+      "username": "Eva",
+      "is_active": true
+    }
+  ]
+}
+
+###
+
+### 3. Получить команду backend и убедиться, что участники вернулись
+
+GET {{baseUrl}}/team/get?team_name=backend
+Accept: application/json
+
+###
+
+### 4. Деактивировать пользователя u3
+
+POST {{baseUrl}}/users/setIsActive
+Content-Type: application/json
+Accept: application/json
+
+{
+  "user_id": "u3",
+  "is_active": false
+}
+
+###
+
+### 5. Создать PR pr-1001 от автора u1 (ожидаем назначение 1–2 ревьюеров из команды)
+
+POST {{baseUrl}}/pullRequest/create
+Content-Type: application/json
+Accept: application/json
+
+{
+  "pull_request_id": "pr-1001",
+  "pull_request_name": "Add search feature",
+  "author_id": "u1"
+}
+
+###
+
+### 6. Проверить, что u2 (и/или другой) назначен ревьюером — через users/getReview
+
+GET {{baseUrl}}/users/getReview?user_id=u2
+Accept: application/json
+
+###
+
+### 7. Переназначить ревьювера u2 в PR pr-1001 на другого из команды
+
+POST {{baseUrl}}/pullRequest/reassign
+Content-Type: application/json
+Accept: application/json
+
+{
+  "pull_request_id": "pr-1001",
+  "old_user_id": "u2"
+}
+
+###
+
+### 8. Проверить, что у нового ревьювера есть этот PR
+
+# Подставь идентификатор из поля "replaced_by" предыдущего ответа
+GET {{baseUrl}}/users/getReview?user_id=u3
+Accept: application/json
+
+###
+
+### 9. Смёржить PR pr-1001
+
+POST {{baseUrl}}/pullRequest/merge
+Content-Type: application/json
+Accept: application/json
+
+{
+  "pull_request_id": "pr-1001"
+}
+
+###
+
+### 10. Проверить, что PR числится в статусе MERGED у ревьюера
+
+GET {{baseUrl}}/users/getReview?user_id=u3
+Accept: application/json

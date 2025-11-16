@@ -62,11 +62,11 @@ func (h *Handler) CreateTeam(c echo.Context) error {
 	h.logger.Info("CreateTeam: валидация данных команды", zap.String("team_name", req.TeamName), zap.Int("members_count", len(req.Members)))
 
 	// Проверяем существование команды
-	existing, err := h.repo.GetTeam(c.Request().Context(), req.TeamName)
-	if err == nil && existing != nil {
-		h.logger.Warn("CreateTeam: команда уже существует", zap.String("team_name", req.TeamName))
-		return c.JSON(http.StatusBadRequest, newErrorResponse(ErrCodeTeamExists, "team_name already exists"))
-	}
+	// existing, err := h.repo.GetTeam(c.Request().Context(), req.TeamName)
+	// if err == nil && existing != nil {
+	// 	h.logger.Warn("CreateTeam: команда уже существует", zap.String("team_name", req.TeamName))
+	// 	return c.JSON(http.StatusBadRequest, newErrorResponse(ErrCodeTeamExists, "team_name already exists"))
+	// }
 
 	team, err := h.repo.CreateTeam(c.Request().Context(), req)
 	if err != nil {
