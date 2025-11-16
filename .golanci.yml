@@ -18,4 +18,4 @@ issues:
 
 linters-settings:
   gofumpt:
-    module-path: github.com/yourname/pr-manager
+    module-path: github.com/untibullet/pr-manager-avito
