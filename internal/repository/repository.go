@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/untibullet/pr-manager-avito/internal/models"
 )
@@ -28,65 +29,10 @@ func New(pool *pgxpool.Pool) *Repository {
 	return &Repository{pool: pool}
 }
 
-// CreateUser создает нового пользователя
-func (r *Repository) CreateUser(ctx context.Context, username string, isActive bool) (*models.User, error) {
-	var userID int64
-	query := `INSERT INTO users (name, is_active) VALUES ($1, $2) RETURNING id`
-
-	err := r.pool.QueryRow(ctx, query, username, isActive).Scan(&userID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create user: %w", err)
-	}
-
-	return &models.User{
-		UserID:   strconv.FormatInt(userID, 10),
-		Username: username,
-		IsActive: isActive,
-	}, nil
-}
-
-// GetUser получает пользователя по ID с информацией о команде
-func (r *Repository) GetUser(ctx context.Context, userID string) (*models.User, error) {
-	id, err := strconv.ParseInt(userID, 10, 64)
-	if err != nil {
-		return nil, ErrInvalidInput
-	}
-
-	user := &models.User{}
-	query := `
-        SELECT u.id, u.name, u.is_active, COALESCE(t.name, '') as team_name
-        FROM users u
-        LEFT JOIN team_users tu ON u.id = tu.user_id
-        LEFT JOIN teams t ON tu.team_id = t.id
-        WHERE u.id = $1
-        LIMIT 1
-    `
-
-	var id64 int64
-	var teamName string
-	err = r.pool.QueryRow(ctx, query, id).Scan(&id64, &user.Username, &user.IsActive, &teamName)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to get user: %w", err)
-	}
-
-	user.UserID = strconv.FormatInt(id64, 10)
-	user.TeamName = teamName
-
-	return user, nil
-}
-
-// UpdateUserStatus обновляет статус активности пользователя
+// UpdateUserStatus обновляет статус активности пользователя по внешнему ID
 func (r *Repository) UpdateUserStatus(ctx context.Context, userID string, isActive bool) error {
-	id, err := strconv.ParseInt(userID, 10, 64)
-	if err != nil {
-		return ErrInvalidInput
-	}
-
-	query := `UPDATE users SET is_active = $1, updated_at = NOW() WHERE id = $2`
-	tag, err := r.pool.Exec(ctx, query, isActive, id)
+	query := `UPDATE users SET is_active = $1, updated_at = NOW() WHERE external_id = $2`
+	tag, err := r.pool.Exec(ctx, query, isActive, userID)
 	if err != nil {
 		return fmt.Errorf("failed to update user status: %w", err)
 	}
@@ -96,177 +42,140 @@ func (r *Repository) UpdateUserStatus(ctx context.Context, userID string, isActi
 	return nil
 }
 
-// CreateTeam создает новую команду
-func (r *Repository) CreateTeam(ctx context.Context, teamName string) (*models.Team, error) {
-	query := `INSERT INTO teams (name) VALUES ($1) RETURNING id`
+// CreateTeam создает или обновляет команду и ее участников
+func (r *Repository) CreateTeam(ctx context.Context, teamData models.Team) (*models.Team, error) {
+    tx, err := r.pool.Begin(ctx)
+    if err != nil {
+        return nil, fmt.Errorf("failed to begin transaction: %w", err)
+    }
+    defer tx.Rollback(ctx)
 
-	var teamID int64
-	err := r.pool.QueryRow(ctx, query, teamName).Scan(&teamID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create team: %w", err)
-	}
+    // Создаем или получаем ID существующей команды
+    var teamID int64
+    teamUpsertQuery := `
+        INSERT INTO teams (name) VALUES ($1)
+        ON CONFLICT (name) DO UPDATE SET updated_at = NOW()
+        RETURNING id
+    `
+    err = tx.QueryRow(ctx, teamUpsertQuery, teamData.TeamName).Scan(&teamID)
+    if err != nil {
+        return nil, fmt.Errorf("failed to upsert team: %w", err)
+    }
 
-	return &models.Team{
-		TeamName: teamName,
-		Members:  []models.TeamMember{},
-	}, nil
+    // Готовим данные для массового "upsert" пользователей
+    userExternalIDs := make([]string, len(teamData.Members))
+    userNames := make([]string, len(teamData.Members))
+    userIsActive := make([]bool, len(teamData.Members))
+    for i, member := range teamData.Members {
+        userExternalIDs[i] = member.UserID
+        userNames[i] = member.Username
+        userIsActive[i] = member.IsActive
+    }
+
+    // Массово создаем или обновляем всех пользователей одним запросом
+    userUpsertQuery := `
+        INSERT INTO users (external_id, name, is_active)
+        SELECT * FROM unnest($1::varchar[], $2::varchar[], $3::boolean[])
+        ON CONFLICT (external_id) DO UPDATE
+        SET name = excluded.name, is_active = excluded.is_active, updated_at = NOW()
+        RETURNING id, external_id
+    `
+    rows, err := tx.Query(ctx, userUpsertQuery, userExternalIDs, userNames, userIsActive)
+    if err != nil {
+        return nil, fmt.Errorf("failed to upsert users: %w", err)
+    }
+    
+    // Собираем мапу "внешний ID" -> "внутренний ID" для дальнейшей работы
+    userInternalIDs := make(map[string]int64, len(teamData.Members))
+    for rows.Next() {
+        var internalID int64
+        var externalID string
+        if err := rows.Scan(&internalID, &externalID); err != nil {
+            rows.Close()
+            return nil, fmt.Errorf("failed to scan upserted user: %w", err)
+        }
+        userInternalIDs[externalID] = internalID
+    }
+    rows.Close()
+
+    // Очищаем старый состав команды
+    _, err = tx.Exec(ctx, "DELETE FROM team_users WHERE team_id = $1", teamID)
+    if err != nil {
+        return nil, fmt.Errorf("failed to clear old team members: %w", err)
+    }
+    
+    // Добавляем новый состав
+    newMembers := make([][]interface{}, 0, len(teamData.Members))
+    for _, member := range teamData.Members {
+        internalID, ok := userInternalIDs[member.UserID]
+        if ok {
+            newMembers = append(newMembers, []interface{}{teamID, internalID})
+        }
+    }
+    
+    _, err = tx.CopyFrom(
+        ctx,
+        pgx.Identifier{"team_users"},
+        []string{"team_id", "user_id"},
+        pgx.CopyFromRows(newMembers),
+    )
+    if err != nil {
+        return nil, fmt.Errorf("failed to copy new members: %w", err)
+    }
+
+    if err = tx.Commit(ctx); err != nil {
+        return nil, fmt.Errorf("failed to commit transaction: %w", err)
+    }
+    
+    return &teamData, nil
 }
 
-// GetTeam получает команду по ID
-func (r *Repository) GetTeam(ctx context.Context, teamID string) (*models.Team, error) {
-	id, err := strconv.ParseInt(teamID, 10, 64)
-	if err != nil {
-		return nil, ErrInvalidInput
-	}
+// GetTeam получает команду по ее имени со списком всех участников
+func (r *Repository) GetTeam(ctx context.Context, teamName string) (*models.Team, error) {
+    // Находим команду по имени
+    var teamID int64
+    err := r.pool.QueryRow(ctx, "SELECT id FROM teams WHERE name = $1", teamName).Scan(&teamID)
+    if errors.Is(err, pgx.ErrNoRows) {
+        return nil, ErrNotFound
+    }
+    if err != nil {
+        return nil, fmt.Errorf("failed to get team by name: %w", err)
+    }
 
-	// Проверяем существование команды и получаем название
-	var teamName string
-	query := `SELECT name FROM teams WHERE id = $1`
-	err = r.pool.QueryRow(ctx, query, id).Scan(&teamName)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrNotFound
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to get team: %w", err)
-	}
-
-	// Получаем всех участников команды
-	membersQuery := `
-        SELECT u.id, u.name, u.is_active
+    // Получаем всех участников команды
+    query := `
+        SELECT u.external_id, u.name, u.is_active
         FROM users u
         JOIN team_users tu ON u.id = tu.user_id
         WHERE tu.team_id = $1
         ORDER BY u.name
     `
+    rows, err := r.pool.Query(ctx, query, teamID)
+    if err != nil {
+        return nil, fmt.Errorf("failed to get team members: %w", err)
+    }
+    defer rows.Close()
 
-	rows, err := r.pool.Query(ctx, membersQuery, id)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get team members: %w", err)
-	}
-	defer rows.Close()
+    var members []models.TeamMember
+    for rows.Next() {
+        var member models.TeamMember
+        if err := rows.Scan(&member.UserID, &member.Username, &member.IsActive); err != nil {
+            return nil, fmt.Errorf("failed to scan team member: %w", err)
+        }
+        members = append(members, member)
+    }
+    if err := rows.Err(); err != nil {
+        return nil, fmt.Errorf("failed to iterate team members: %w", err)
+    }
 
-	var members []models.TeamMember
-	for rows.Next() {
-		var userID int64
-		var username string
-		var isActive bool
-
-		if err := rows.Scan(&userID, &username, &isActive); err != nil {
-			return nil, fmt.Errorf("failed to scan team member: %w", err)
-		}
-
-		members = append(members, models.TeamMember{
-			UserID:   strconv.FormatInt(userID, 10),
-			Username: username,
-			IsActive: isActive,
-		})
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("failed to iterate team members: %w", err)
-	}
-
-	return &models.Team{
-		TeamName: teamName,
-		Members:  members,
-	}, nil
+    return &models.Team{
+        TeamName: teamName,
+        Members:  members,
+    }, nil
 }
 
-// AddUserToTeam добавляет пользователя в команду
-func (r *Repository) AddUserToTeam(ctx context.Context, teamID, userID string) error {
-	tID, err := strconv.ParseInt(teamID, 10, 64)
-	if err != nil {
-		return ErrInvalidInput
-	}
-	uID, err := strconv.ParseInt(userID, 10, 64)
-	if err != nil {
-		return ErrInvalidInput
-	}
-
-	// Проверяем существование команды и пользователя
-	var exists bool
-	checkQuery := `
-        SELECT EXISTS(SELECT 1 FROM teams WHERE id = $1) AND
-               EXISTS(SELECT 1 FROM users WHERE id = $2)
-    `
-	err = r.pool.QueryRow(ctx, checkQuery, tID, uID).Scan(&exists)
-	if err != nil {
-		return fmt.Errorf("failed to check existence: %w", err)
-	}
-	if !exists {
-		return ErrNotFound
-	}
-
-	query := `INSERT INTO team_users (team_id, user_id) VALUES ($1, $2) 
-              ON CONFLICT (team_id, user_id) DO NOTHING`
-	_, err = r.pool.Exec(ctx, query, tID, uID)
-	if err != nil {
-		return fmt.Errorf("failed to add user to team: %w", err)
-	}
-
-	return nil
-}
-
-// RemoveUserFromTeam удаляет пользователя из команды
-func (r *Repository) RemoveUserFromTeam(ctx context.Context, teamID, userID string) error {
-	tID, err := strconv.ParseInt(teamID, 10, 64)
-	if err != nil {
-		return ErrInvalidInput
-	}
-	uID, err := strconv.ParseInt(userID, 10, 64)
-	if err != nil {
-		return ErrInvalidInput
-	}
-
-	query := `DELETE FROM team_users WHERE team_id = $1 AND user_id = $2`
-	tag, err := r.pool.Exec(ctx, query, tID, uID)
-	if err != nil {
-		return fmt.Errorf("failed to remove user from team: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		return ErrNotFound
-	}
-
-	return nil
-}
-
-// GetActiveTeamMembers получает активных участников команды (исключая authorID)
-func (r *Repository) GetActiveTeamMembers(ctx context.Context, teamID, excludeUserID string) ([]string, error) {
-	tID, err := strconv.ParseInt(teamID, 10, 64)
-	if err != nil {
-		return nil, ErrInvalidInput
-	}
-	eID, err := strconv.ParseInt(excludeUserID, 10, 64)
-	if err != nil {
-		return nil, ErrInvalidInput
-	}
-
-	query := `
-        SELECT tu.user_id 
-        FROM team_users tu
-        JOIN users u ON tu.user_id = u.id
-        WHERE tu.team_id = $1 AND u.is_active = true AND tu.user_id != $2
-    `
-
-	rows, err := r.pool.Query(ctx, query, tID, eID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get active team members: %w", err)
-	}
-	defer rows.Close()
-
-	var members []string
-	for rows.Next() {
-		var userID int64
-		if err := rows.Scan(&userID); err != nil {
-			return nil, fmt.Errorf("failed to scan user id: %w", err)
-		}
-		members = append(members, strconv.FormatInt(userID, 10))
-	}
-
-	return members, rows.Err()
-}
-
-// CreatePR создает новый PR и автоматически назначает до 2 ревьюеров из команды автора
+// CreatePR создает новый PR и автоматически назначает до 2 ревьюеров из команды автора.
+// Метод идемпотентен: при повторном вызове с тем же pullRequestID вернет ошибку ErrAlreadyExists.
 func (r *Repository) CreatePR(ctx context.Context, pullRequestID, pullRequestName, authorID string) (*models.PullRequest, error) {
 	aID, err := strconv.ParseInt(authorID, 10, 64)
 	if err != nil {
@@ -279,7 +188,7 @@ func (r *Repository) CreatePR(ctx context.Context, pullRequestID, pullRequestNam
 	}
 	defer tx.Rollback(ctx)
 
-	// Проверяем, существует ли PR с таким внешним ID (для 409 Conflict)
+	// Проверка на существование PR с таким внешним ID (для 409 Conflict)
 	var exists bool
 	checkQuery := `SELECT EXISTS(SELECT 1 FROM pull_requests WHERE external_id = $1)`
 	err = tx.QueryRow(ctx, checkQuery, pullRequestID).Scan(&exists)
@@ -290,29 +199,28 @@ func (r *Repository) CreatePR(ctx context.Context, pullRequestID, pullRequestNam
 		return nil, ErrAlreadyExists
 	}
 
-	// Находим команду автора
+	// Определение команды автора для поиска ревьюеров
 	var teamID int64
 	teamQuery := `SELECT team_id FROM team_users WHERE user_id = $1 LIMIT 1`
 	err = tx.QueryRow(ctx, teamQuery, aID).Scan(&teamID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrNotFound // Автор не в команде
+		return nil, ErrNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("failed to get author team: %w", err)
+		return nil, fmt.Errorf("failed to get author's team: %w", err)
 	}
 
-	// Получаем активных участников команды (исключая автора)
+	// Выбор до 2-х случайных активных ревьюеров из команды, исключая автора
 	candidatesQuery := `
         SELECT tu.user_id
         FROM team_users tu
         JOIN users u ON tu.user_id = u.id
-        WHERE tu.team_id = $1 
-          AND u.is_active = true 
+        WHERE tu.team_id = $1
+          AND u.is_active = true
           AND tu.user_id != $2
         ORDER BY RANDOM()
         LIMIT 2
     `
-
 	rows, err := tx.Query(ctx, candidatesQuery, teamID, aID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get reviewer candidates: %w", err)
@@ -328,12 +236,11 @@ func (r *Repository) CreatePR(ctx context.Context, pullRequestID, pullRequestNam
 		reviewerIDs = append(reviewerIDs, rID)
 	}
 	rows.Close()
-
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("failed to iterate reviewers: %w", err)
 	}
 
-	// Создаем PR (внутренний ID генерируется БД, внешний задан клиентом)
+	// Создание основной записи о PR в базе данных
 	var internalID int64
 	var createdAt time.Time
 	insertQuery := `
@@ -341,18 +248,19 @@ func (r *Repository) CreatePR(ctx context.Context, pullRequestID, pullRequestNam
         VALUES ($1, $2, $3, $4) 
         RETURNING id, created_at
     `
-
 	err = tx.QueryRow(ctx, insertQuery, pullRequestID, pullRequestName, aID, models.StatusOpen).Scan(&internalID, &createdAt)
 	if err != nil {
+		// Обработка возможного race condition
+		if pgxErr, ok := err.(*pgconn.PgError); ok && pgxErr.Code == "23505" {
+			return nil, ErrAlreadyExists
+		}
 		return nil, fmt.Errorf("failed to create PR: %w", err)
 	}
 
-	// Назначаем найденных ревьюеров
-	assignedReviewers := []string{}
+	// Привязка найденных ревьюеров к созданному PR
+	assignedReviewers := make([]string, 0, len(reviewerIDs))
 	for _, rID := range reviewerIDs {
-		_, err = tx.Exec(ctx,
-			`INSERT INTO pr_reviewers (pr_id, reviewer_id) VALUES ($1, $2)`,
-			internalID, rID)
+		_, err = tx.Exec(ctx, `INSERT INTO pr_reviewers (pr_id, reviewer_id) VALUES ($1, $2)`, internalID, rID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to assign reviewer: %w", err)
 		}
@@ -364,45 +272,45 @@ func (r *Repository) CreatePR(ctx context.Context, pullRequestID, pullRequestNam
 	}
 
 	pr := &models.PullRequest{
-		PullRequestID:     pullRequestID, // Внешний ID от клиента
+		PullRequestID:     pullRequestID,
 		PullRequestName:   pullRequestName,
 		AuthorID:          authorID,
 		Status:            models.StatusOpen,
-		AssignedReviewers: assignedReviewers, // 0-2 ревьюера
+		AssignedReviewers: assignedReviewers,
 		CreatedAt:         &createdAt,
 	}
 
 	return pr, nil
 }
 
-// GetPR получает PR по ID с ревьюерами
-func (r *Repository) GetPR(ctx context.Context, prID string) (*models.PullRequest, error) {
-	id, err := strconv.ParseInt(prID, 10, 64)
-	if err != nil {
-		return nil, ErrInvalidInput
+// GetPR получает PR по внешнему ID с ревьюерами
+func (r *Repository) GetPR(ctx context.Context, pullRequestID string) (*models.PullRequest, error) {
+	pr := &models.PullRequest{
+		PullRequestID: pullRequestID,
 	}
 
-	pr := &models.PullRequest{}
-	query := `SELECT id, title, author_id, status, created_at, updated_at 
-              FROM pull_requests WHERE id = $1`
+	query := `
+        SELECT id, title, author_id, status, created_at, merged_at 
+        FROM pull_requests 
+        WHERE external_id = $1
+    `
 
-	var id64, authorID64 int64
-	var createdAt, updatedAt time.Time
-	err = r.pool.QueryRow(ctx, query, id).Scan(
-		&id64, &pr.PullRequestName, &authorID64, &pr.Status, &createdAt, &updatedAt,
+	var internalID, authorID64 int64
+
+	err := r.pool.QueryRow(ctx, query, pullRequestID).Scan(
+		&internalID, &pr.PullRequestName, &authorID64, &pr.Status, &pr.CreatedAt, &pr.MergedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
-		return nil, fmt.Errorf("failed to get PR: %w", err)
+		return nil, fmt.Errorf("failed to get PR by external id: %w", err)
 	}
 
-	pr.PullRequestID = strconv.FormatInt(id64, 10)
 	pr.AuthorID = strconv.FormatInt(authorID64, 10)
 
-	// Получаем ревьюеров
-	reviewers, err := r.getPRReviewers(ctx, id)
+	// Получаем ревьюеров по внутреннему ID
+	reviewers, err := r.getPRReviewers(ctx, internalID)
 	if err != nil {
 		return nil, err
 	}
@@ -411,7 +319,7 @@ func (r *Repository) GetPR(ctx context.Context, prID string) (*models.PullReques
 	return pr, nil
 }
 
-// GetPRReviewers получает список ревьюеров для PR
+// getPRReviewers получает список ревьюеров для PR по внутреннему ID
 func (r *Repository) getPRReviewers(ctx context.Context, prID int64) ([]string, error) {
 	query := `SELECT reviewer_id FROM pr_reviewers WHERE pr_id = $1`
 	rows, err := r.pool.Query(ctx, query, prID)
@@ -432,35 +340,43 @@ func (r *Repository) getPRReviewers(ctx context.Context, prID int64) ([]string, 
 	return reviewers, rows.Err()
 }
 
-// MergePR переводит PR в статус MERGED (идемпотентно)
-func (r *Repository) MergePR(ctx context.Context, prID string) (*models.PullRequest, error) {
-	id, err := strconv.ParseInt(prID, 10, 64)
-	if err != nil {
-		return nil, ErrInvalidInput
+// MergePR переводит PR в статус MERGED по внешнему ID (идемпотентно)
+func (r *Repository) MergePR(ctx context.Context, pullRequestID string) (*models.PullRequest, error) {
+	pr := &models.PullRequest{
+		PullRequestID: pullRequestID,
 	}
 
-	pr := &models.PullRequest{}
-	query := `UPDATE pull_requests SET status = $1, updated_at = NOW() 
-              WHERE id = $2
-              RETURNING id, title, author_id, status, created_at, updated_at`
+	query := `
+        UPDATE pull_requests 
+        SET status = $1, merged_at = NOW() 
+        WHERE external_id = $2
+        RETURNING id, title, author_id, status, created_at, merged_at
+    `
 
-	var prID64, authorID64 int64
-	var createdAt, updatedAt time.Time
-	err = r.pool.QueryRow(ctx, query, models.StatusMerged, id).Scan(
-		&prID64, &pr.PullRequestName, &authorID64, &pr.Status, &createdAt, &updatedAt,
+	var internalID, authorID64 int64
+
+	err := r.pool.QueryRow(ctx, query, models.StatusMerged, pullRequestID).Scan(
+		&internalID, &pr.PullRequestName, &authorID64, &pr.Status, &pr.CreatedAt, &pr.MergedAt,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, ErrNotFound
+		// Если PR не найден, нужно проверить, не был ли он уже смержен
+		mergedPR, getErr := r.GetPR(ctx, pullRequestID)
+		if getErr != nil {
+			return nil, ErrNotFound // Не найден вообще
+		}
+		if mergedPR.Status == models.StatusMerged {
+			return mergedPR, nil // Уже смержен, возвращаем актуальное состояние
+		}
+		return nil, ErrNotFound // Другая причина, почему не обновился
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to merge PR: %w", err)
 	}
 
-	pr.PullRequestID = strconv.FormatInt(prID64, 10)
 	pr.AuthorID = strconv.FormatInt(authorID64, 10)
 
 	// Получаем ревьюеров
-	reviewers, err := r.getPRReviewers(ctx, id)
+	reviewers, err := r.getPRReviewers(ctx, internalID)
 	if err != nil {
 		return nil, err
 	}
@@ -470,11 +386,7 @@ func (r *Repository) MergePR(ctx context.Context, prID string) (*models.PullRequ
 }
 
 // ReassignReviewer переназначает ревьюера
-func (r *Repository) ReassignReviewer(ctx context.Context, prID, oldReviewerID, newReviewerID string) error {
-	pID, err := strconv.ParseInt(prID, 10, 64)
-	if err != nil {
-		return ErrInvalidInput
-	}
+func (r *Repository) ReassignReviewer(ctx context.Context, pullRequestID, oldReviewerID, newReviewerID string) error {
 	oID, err := strconv.ParseInt(oldReviewerID, 10, 64)
 	if err != nil {
 		return ErrInvalidInput
@@ -490,9 +402,12 @@ func (r *Repository) ReassignReviewer(ctx context.Context, prID, oldReviewerID, 
 	}
 	defer tx.Rollback(ctx)
 
-	// Проверяем статус PR
+	// Находим внутренний ID и проверяем статус
+	var internalID int64
 	var status string
-	err = tx.QueryRow(ctx, `SELECT status FROM pull_requests WHERE id = $1`, pID).Scan(&status)
+	checkQuery := `SELECT id, status FROM pull_requests WHERE external_id = $1`
+
+	err = tx.QueryRow(ctx, checkQuery, pullRequestID).Scan(&internalID, &status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -503,9 +418,9 @@ func (r *Repository) ReassignReviewer(ctx context.Context, prID, oldReviewerID, 
 		return ErrAlreadyMerged
 	}
 
-	// Удаляем старого ревьюера
+	// Удаляем старого ревьюера по внутреннему ID
 	tag, err := tx.Exec(ctx, `DELETE FROM pr_reviewers WHERE pr_id = $1 AND reviewer_id = $2`,
-		pID, oID)
+		internalID, oID)
 	if err != nil {
 		return fmt.Errorf("failed to remove old reviewer: %w", err)
 	}
@@ -513,10 +428,10 @@ func (r *Repository) ReassignReviewer(ctx context.Context, prID, oldReviewerID, 
 		return ErrNotFound
 	}
 
-	// Добавляем нового ревьюера
+	// Добавляем нового ревьюера по внутреннему ID
 	_, err = tx.Exec(ctx, `INSERT INTO pr_reviewers (pr_id, reviewer_id) VALUES ($1, $2)
                            ON CONFLICT DO NOTHING`,
-		pID, nID)
+		internalID, nID)
 	if err != nil {
 		return fmt.Errorf("failed to add new reviewer: %w", err)
 	}
@@ -558,7 +473,7 @@ func (r *Repository) GetPRsByReviewer(ctx context.Context, reviewerID string) ([
 	}
 
 	query := `
-        SELECT DISTINCT pr.id, pr.title, pr.author_id, pr.status
+        SELECT DISTINCT pr.external_id, pr.title, pr.author_id, pr.status
         FROM pull_requests pr
         JOIN pr_reviewers prr ON pr.id = prr.pr_id
         WHERE prr.reviewer_id = $1
@@ -574,13 +489,12 @@ func (r *Repository) GetPRsByReviewer(ctx context.Context, reviewerID string) ([
 	var prs []models.PullRequestShort
 	for rows.Next() {
 		var pr models.PullRequestShort
-		var prID, authorID int64
+		var authorID int64
 
-		if err := rows.Scan(&prID, &pr.PullRequestName, &authorID, &pr.Status); err != nil {
+		if err := rows.Scan(&pr.PullRequestID, &pr.PullRequestName, &authorID, &pr.Status); err != nil {
 			return nil, fmt.Errorf("failed to scan PR: %w", err)
 		}
 
-		pr.PullRequestID = strconv.FormatInt(prID, 10)
 		pr.AuthorID = strconv.FormatInt(authorID, 10)
 		prs = append(prs, pr)
 	}

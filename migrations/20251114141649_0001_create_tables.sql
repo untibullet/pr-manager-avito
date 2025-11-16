@@ -2,6 +2,7 @@
 -- +goose StatementBegin
 CREATE TABLE users (
     id BIGSERIAL PRIMARY KEY,
+    external_id VARCHAR(255) NOT NULL UNIQUE,
     name VARCHAR(255) NOT NULL,
     is_active BOOLEAN NOT NULL DEFAULT true,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
@@ -24,10 +25,11 @@ CREATE TABLE team_users (
 
 CREATE TABLE pull_requests (
     id BIGSERIAL PRIMARY KEY,
-    external_id VARCHAR(255) UNIQUE NOT NULL,
+    external_id VARCHAR(255) NOT NULL UNIQUE,
     title VARCHAR(500) NOT NULL,
     author_id BIGINT NOT NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'MERGED')),
+    merged_at TIMESTAMP,
     created_at TIMESTAMP NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
@@ -40,6 +42,7 @@ CREATE TABLE pr_reviewers (
 );
 
 CREATE INDEX idx_users_is_active ON users(is_active);
+CREATE INDEX idx_users_external_id ON users(external_id);
 CREATE INDEX idx_team_users_user_id ON team_users(user_id);
 CREATE INDEX idx_team_users_team_id ON team_users(team_id);
 CREATE INDEX idx_pull_requests_external_id ON pull_requests(external_id);
