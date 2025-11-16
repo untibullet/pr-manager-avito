@@ -16,11 +16,54 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d &{DB_NAME}"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
+    networks:
+      - pr-manager-network
+
+  migrator:
+    image: ghcr.io/kukymbr/goose-docker:3.18.0
+    container_name: pr-manager-migrator
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./migrations:/migrations:ro,Z
+    environment:
+      GOOSE_DRIVER: postgres
+      GOOSE_DBSTRING: "host=db port=${DB_PORT} user=${DB_USER} password=${DB_PASSWORD} dbname=${DB_NAME} sslmode=disable"
+      GOOSE_MIGRATION_DIR: /migrations
+    command: ["up"]
+    networks:
+      - pr-manager-network
+    restart: "no"
+  
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pr-manager-app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+      DB_SSLMODE: "disable"
+
+      SERVER_HOST: "0.0.0.0"
+      SERVER_PORT: "${APP_PORT}"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro,Z
+    ports:
+      - "${HOST_PORT}:${APP_PORT}"
     networks:
       - pr-manager-network
 
