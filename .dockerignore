@@ -1,0 +1,16 @@
+# Git
+.git
+.gitignore
+
+# Конфигурация и переменные окружения
+.env
+.env.example
+config.yaml
+
+# Зависимости и локальные файлы
+.vscode/
+
+# Документация и E2E тесты
+README.md
+e2e/
+docs/

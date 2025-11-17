@@ -39,9 +39,6 @@ WORKDIR /app
 # Бинарь
 COPY --from=build --chown=appuser:appgroup /app/pr-manager-service /usr/local/bin/pr-manager-service
 
-# Конфиг
-COPY --chown=appuser:appgroup config.yaml /app/config.yaml
-
 # Порт HTTP-сервера
 EXPOSE 8080
 

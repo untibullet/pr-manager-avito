@@ -51,17 +51,15 @@ services:
       db:
         condition: service_healthy
     environment:
-      DB_HOST: db
-      DB_PORT: "5432"
+      DB_HOST: "${DB_HOST}"
+      DB_PORT: "${DB_PORT}"
       DB_USER: ${DB_USER}
       DB_PASSWORD: ${DB_PASSWORD}
       DB_NAME: ${DB_NAME}
-      DB_SSLMODE: "disable"
+      DB_SSLMODE: "${DB_SSLMODE}"
 
-      SERVER_HOST: "0.0.0.0"
-      SERVER_PORT: "${APP_PORT}"
-    volumes:
-      - ./config.yaml:/app/config.yaml:ro,Z
+      APP_HOST: "${APP_HOST}"
+      APP_PORT: "${APP_PORT}"
     ports:
       - "${HOST_PORT}:${APP_PORT}"
     networks:
