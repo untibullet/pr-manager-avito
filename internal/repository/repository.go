@@ -681,3 +681,35 @@ func (r *Repository) GetPRsByReviewer(ctx context.Context, reviewerID string) ([
 
     return prs, rows.Err()
 }
+
+// GetUserReviewStats возвращает статистику по количеству назначенных ревью для каждого пользователя.
+func (r *Repository) GetUserReviewStats(ctx context.Context) ([]models.UserReviewStats, error) {
+	query := `
+		SELECT
+			u.external_id,
+			u.name,
+			COUNT(prr.pr_id) AS review_count
+		FROM
+			users u
+		LEFT JOIN
+			pr_reviewers prr ON u.id = prr.reviewer_id
+		GROUP BY
+			u.id, u.external_id, u.name
+		ORDER BY
+			review_count DESC, u.name ASC
+	`
+
+	rows, err := r.pool.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query user review stats: %w", err)
+	}
+	defer rows.Close()
+
+	var stats []models.UserReviewStats
+	stats, err = pgx.CollectRows(rows, pgx.RowToStructByName[models.UserReviewStats])
+	if err != nil {
+		return nil, fmt.Errorf("failed to collect stats rows: %w", err)
+	}
+
+	return stats, nil
+}

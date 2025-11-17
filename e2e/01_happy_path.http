@@ -69,7 +69,7 @@ Content-Type: application/json
 Accept: application/json
 
 {
-  "pull_request_id": "pr-1002",
+  "pull_request_id": "pr-1003",
   "pull_request_name": "Add search feature",
   "author_id": "u3"
 }
@@ -119,4 +119,11 @@ Accept: application/json
 ### 10. Проверить, что PR числится в статусе MERGED у ревьюера
 
 GET {{baseUrl}}/users/getReview?user_id=u4
+Accept: application/json
+
+###
+
+### 11. Проверить, что PR числится в статусе MERGED у ревьюера
+
+GET {{baseUrl}}/stats
 Accept: application/json

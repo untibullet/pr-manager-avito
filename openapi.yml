@@ -120,6 +120,20 @@ components:
         status:
           type: string
           enum: [OPEN, MERGED]
+    UserReviewStats:
+    type: object
+    required: [ user_id, username, review_count ]
+    properties:
+      user_id:
+        type: string
+        description: Идентификатор пользователя
+      username:
+        type: string
+        description: Имя пользователя
+      review_count:
+        type: integer
+        format: int32
+        description: Общее количество PR, в которых пользователь был назначен ревьюером
 
 paths:
   /team/add:
@@ -419,3 +433,41 @@ paths:
                     pull_request_name: Add search
                     author_id: u1
                     status: OPEN
+  /stats:
+    get:
+      tags: [Statistics]
+      summary: Получить статистику по количеству ревью для каждого пользователя
+      responses:
+        '200':
+          description: Статистика по назначениям
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [stats]
+                properties:
+                  stats:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/UserReviewStats'
+              example:
+                stats:
+                  - user_id: "u2"
+                    username: "Bob"
+                    review_count: 15
+                  - user_id: "u1"
+                    username: "Alice"
+                    review_count: 8
+                  - user_id: "u3"
+                    username: "Charlie"
+                    review_count: 0
+        '500':
+          description: Внутренняя ошибка сервера при сборе статистики
+          content:
+            application/json:
+              schema: 
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error:
+                  code: "STATS_ERROR"
+                  message: "failed to get stats"

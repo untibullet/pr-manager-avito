@@ -43,6 +43,13 @@ type PullRequestShort struct {
     Status          string `json:"status" db:"status"`
 }
 
+// UserReviewStats представляет статистику по назначениям ревью.
+type UserReviewStats struct {
+	UserID      string `json:"user_id" db:"external_id"`
+	Username    string `json:"username" db:"name"`
+	ReviewCount int    `json:"review_count" db:"review_count"`
+}
+
 // Константы статусов PR
 const (
     StatusOpen   = "OPEN"

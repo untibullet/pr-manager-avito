@@ -33,6 +33,25 @@ func New(repo *repository.Repository, logger *zap.Logger) *Handler {
 	}
 }
 
+// RegisterRoutes регистрирует все маршруты API
+func (h *Handler) RegisterRoutes(e *echo.Echo) {
+	// Teams
+	e.POST("/team/add", h.CreateTeam)
+	e.GET("/team/get", h.GetTeam)
+
+	// Users
+	e.POST("/users/setIsActive", h.SetUserIsActive)
+	e.GET("/users/getReview", h.GetUserReviews)
+
+	// Pull Requests
+	e.POST("/pullRequest/create", h.CreatePullRequest)
+	e.POST("/pullRequest/merge", h.MergePullRequest)
+	e.POST("/pullRequest/reassign", h.ReassignReviewer)
+	
+	// Statistics
+	e.GET("/stats", h.GetStats)
+}
+
 // ErrorResponse представляет структуру ошибки API
 type ErrorResponse struct {
 	Error struct {
@@ -309,18 +328,17 @@ func (h *Handler) GetUserReviews(c echo.Context) error {
 	return c.JSON(http.StatusOK, response)
 }
 
-// RegisterRoutes регистрирует все маршруты API
-func (h *Handler) RegisterRoutes(e *echo.Echo) {
-	// Teams
-	e.POST("/team/add", h.CreateTeam)
-	e.GET("/team/get", h.GetTeam)
+// GetStats возвращает статистику по ревью
+func (h *Handler) GetStats(c echo.Context) error {
+	h.logger.Info("GetStats: получение статистики по назначениям")
 
-	// Users
-	e.POST("/users/setIsActive", h.SetUserIsActive)
-	e.GET("/users/getReview", h.GetUserReviews)
+	stats, err := h.repo.GetUserReviewStats(c.Request().Context())
+	if err != nil {
+		h.logger.Error("GetStats: ошибка получения статистики", zap.Error(err))
+		return c.JSON(http.StatusInternalServerError, newErrorResponse("STATS_ERROR", "failed to get stats"))
+	}
 
-	// Pull Requests
-	e.POST("/pullRequest/create", h.CreatePullRequest)
-	e.POST("/pullRequest/merge", h.MergePullRequest)
-	e.POST("/pullRequest/reassign", h.ReassignReviewer)
+	h.logger.Info("GetStats: статистика успешно получена", zap.Int("user_count", len(stats)))
+	
+	return c.JSON(http.StatusOK, map[string]interface{}{"stats": stats})
 }
