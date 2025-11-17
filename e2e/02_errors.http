@@ -1,0 +1,86 @@
+@baseUrl = http://localhost:8081
+
+### 1. Healthcheck
+
+GET {{baseUrl}}/health
+Accept: application/json
+
+###
+
+### 2. Получение несуществующей команды (ожидаем NOT_FOUND/404)
+
+GET {{baseUrl}}/team/get?team_name=unknown-team
+Accept: application/json
+
+###
+
+### 3. Установка активности несуществующему пользователю (ожидаем NOT_FOUND/404)
+
+POST {{baseUrl}}/users/setIsActive
+Content-Type: application/json
+Accept: application/json
+
+{
+  "user_id": "non-existent",
+  "is_active": true
+}
+
+###
+
+### 4. Создать PR с уже существующим ID (ожидаем PR_EXISTS/409)
+
+POST {{baseUrl}}/pullRequest/create
+Content-Type: application/json
+Accept: application/json
+
+{
+  "pull_request_id": "pr-1001",
+  "pull_request_name": "Duplicate PR id",
+  "author_id": "u1"
+}
+
+###
+
+### 5. Merge несуществующего PR (ожидаем NOT_FOUND/404)
+
+POST {{baseUrl}}/pullRequest/merge
+Content-Type: application/json
+Accept: application/json
+
+{
+  "pull_request_id": "pr-9999"
+}
+
+###
+
+### 6. Reassign на несуществующий PR (ожидаем NOT_FOUND/404)
+
+POST {{baseUrl}}/pullRequest/reassign
+Content-Type: application/json
+Accept: application/json
+
+{
+  "pull_request_id": "pr-9999",
+  "old_user_id": "u1"
+}
+
+###
+
+### 7. Reassign пользователя, который не назначен ревьювером (ожидаем NOT_ASSIGNED/409)
+
+# Предполагаем, что pr-1001 существует и у него нет ревьювера u999
+POST {{baseUrl}}/pullRequest/reassign
+Content-Type: application/json
+Accept: application/json
+
+{
+  "pull_request_id": "pr-1001",
+  "old_user_id": "u999"
+}
+
+###
+
+### 8. Получить PR'ы для несуществующего пользователя (ожидаем NOT_FOUND/404)
+
+GET {{baseUrl}}/users/getReview?user_id=non-existent
+Accept: application/json

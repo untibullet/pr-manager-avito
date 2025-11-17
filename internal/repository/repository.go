@@ -338,9 +338,14 @@ func (r *Repository) GetPR(ctx context.Context, pullRequestID string) (*models.P
 	return pr, nil
 }
 
-// getPRReviewers получает список ревьюеров для PR по внутреннему ID
+// getPRReviewers получает список внешних ID ревьюеров для PR по внутреннему ID
 func (r *Repository) getPRReviewers(ctx context.Context, prID int64) ([]string, error) {
-	query := `SELECT reviewer_id FROM pr_reviewers WHERE pr_id = $1`
+	query := `
+		SELECT u.external_id
+		FROM pr_reviewers pr
+		JOIN users u ON pr.reviewer_id = u.id
+		WHERE pr.pr_id = $1
+	`
 	rows, err := r.pool.Query(ctx, query, prID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get reviewers: %w", err)
@@ -349,14 +354,18 @@ func (r *Repository) getPRReviewers(ctx context.Context, prID int64) ([]string, 
 
 	var reviewers []string
 	for rows.Next() {
-		var reviewerID int64
-		if err := rows.Scan(&reviewerID); err != nil {
-			return nil, fmt.Errorf("failed to scan reviewer id: %w", err)
+		var reviewerExternalID string
+		if err := rows.Scan(&reviewerExternalID); err != nil {
+			return nil, fmt.Errorf("failed to scan reviewer external id: %w", err)
 		}
-		reviewers = append(reviewers, strconv.FormatInt(reviewerID, 10))
+		reviewers = append(reviewers, reviewerExternalID)
 	}
 
-	return reviewers, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error during rows iteration: %w", err)
+	}
+
+	return reviewers, nil
 }
 
 // MergePR переводит PR в статус MERGED по внешнему ID (идемпотентно)
@@ -423,6 +432,8 @@ func (r *Repository) ReassignReviewerAuto(ctx context.Context, pullRequestID, ol
 	}
 	defer tx.Rollback(ctx)
 
+	fmt.Println("ReassignReviewer: ЭТАП 1")
+
 	// Находим внутренний ID PR и проверяем статус
 	var prInternalID int64
 	var status string
@@ -439,6 +450,8 @@ func (r *Repository) ReassignReviewerAuto(ctx context.Context, pullRequestID, ol
 		return "", ErrAlreadyMerged
 	}
 
+	fmt.Println("ReassignReviewer: ЭТАП 2")
+
 	// Проверяем, что старый ревьюер действительно назначен
 	var exists bool
 	checkReviewerQuery := `SELECT EXISTS(SELECT 1 FROM pr_reviewers WHERE pr_id = $1 AND reviewer_id = $2)`
@@ -450,6 +463,8 @@ func (r *Repository) ReassignReviewerAuto(ctx context.Context, pullRequestID, ol
 	if !exists {
 		return "", ErrNotFound // Ревьюер не назначен
 	}
+
+	fmt.Println("ReassignReviewer: ЭТАП 3")
 
 	// Получаем команду автора PR
 	var teamID int64
@@ -477,6 +492,8 @@ func (r *Repository) ReassignReviewerAuto(ctx context.Context, pullRequestID, ol
 	}
 	rows.Close()
 
+	fmt.Println("ReassignReviewer: ЭТАП 4")
+
 	// Ищем нового кандидата: активный член команды, не автор, не текущий ревьюер
 	candidateQuery := `
 		SELECT tu.user_id
@@ -492,42 +509,72 @@ func (r *Repository) ReassignReviewerAuto(ctx context.Context, pullRequestID, ol
 
 	var newReviewerID int64
 	err = tx.QueryRow(ctx, candidateQuery, teamID, authorID, currentReviewers).Scan(&newReviewerID)
+
+	// Кандидата нет - просто оставляем PR без замены
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", ErrNotFound // Нет подходящих кандидатов
+		fmt.Println("ReassignReviewer: ЭТАП 5")
+
+		// Старого ревьюера всё равно снимаем
+		_, err = tx.Exec(ctx,
+			`DELETE FROM pr_reviewers WHERE pr_id = $1 AND reviewer_id = $2`,
+			prInternalID, rInternalID,
+		)
+		if err != nil {
+			return "", fmt.Errorf("failed to remove old reviewer: %w", err)
+		}
+
+		fmt.Println("ReassignReviewer: ЭТАП 6")
+
+		if err = tx.Commit(ctx); err != nil {
+			return "", fmt.Errorf("failed to commit transaction (no replacement): %w", err)
+		}
+
+		fmt.Println("ReassignReviewer: ЭТАП 7")
+
+		// Возвращаем пустую строку - замены нет, но операция успешна
+		return "", nil
 	}
+
+	fmt.Println("ReassignReviewer: ЭТАП 8")
 
 	if err != nil {
 		return "", fmt.Errorf("failed to find replacement candidate: %w", err)
 	}
 
 	// Удаляем старого ревьюера
-	_, err = tx.Exec(ctx, `DELETE FROM pr_reviewers WHERE pr_id = $1 AND reviewer_id = $2`, prInternalID, rInternalID)
+	_, err = tx.Exec(ctx,
+		`DELETE FROM pr_reviewers WHERE pr_id = $1 AND reviewer_id = $2`,
+		prInternalID, rInternalID,
+	)
 	if err != nil {
 		return "", fmt.Errorf("failed to remove old reviewer: %w", err)
 	}
 
 	// Добавляем нового ревьюера
-    _, err = tx.Exec(ctx, `INSERT INTO pr_reviewers (pr_id, reviewer_id) VALUES ($1, $2)`, prInternalID, newReviewerID)
-    if err != nil {
-        return "", fmt.Errorf("failed to add new reviewer: %w", err)
-    }
+	_, err = tx.Exec(ctx,
+		`INSERT INTO pr_reviewers (pr_id, reviewer_id) VALUES ($1, $2)`,
+		prInternalID, newReviewerID,
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to add new reviewer: %w", err)
+	}
 
-    // Получаем внешний ID нового ревьюера
-    var newReviewerExternalID string
-    getExternalQuery := `SELECT external_id FROM users WHERE id = $1`
-    err = tx.QueryRow(ctx, getExternalQuery, newReviewerID).Scan(&newReviewerExternalID)
-    if errors.Is(err, pgx.ErrNoRows) {
-        return "", ErrNotFound
-    }
-    if err != nil {
-        return "", fmt.Errorf("failed to get new reviewer external id: %w", err)
-    }
+	// Получаем внешний ID нового ревьюера
+	var newReviewerExternalID string
+	getExternalQuery := `SELECT external_id FROM users WHERE id = $1`
+	err = tx.QueryRow(ctx, getExternalQuery, newReviewerID).Scan(&newReviewerExternalID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to get new reviewer external id: %w", err)
+	}
 
-    if err = tx.Commit(ctx); err != nil {
-        return "", fmt.Errorf("failed to commit transaction: %w", err)
-    }
+	if err = tx.Commit(ctx); err != nil {
+		return "", fmt.Errorf("failed to commit transaction: %w", err)
+	}
 
-    return newReviewerExternalID, nil
+	return newReviewerExternalID, nil
 }
 
 // GetUser получает пользователя по внешнему ID
